@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>RAW11 Gamepad</title>
+</head>
+<body>
+<h1>RAW11 Gamepad Bridge</h1>
+<p>Connect your gamepad. RAW11 will start automatically.</p>
+
+<script>
+(() => {
+    'use strict';
+
+    if (window.RAW11_CONSOLE_READY) return;
+    window.RAW11_CONSOLE_READY = true;
+
+    // ---------- Config ----------
+    const POLL_MS = 1;                 
+    const AXIS_EPSILON = 0.00001;      
+    const AXIS_SCALE = 1000;           
+    const KEEPALIVE_MS = 15000;        
+    const WS_URL = 'ws://localhost:8080';
+
+    // ---------- Persistent WS Worker ----------
+    const workerCode = `
+        let ws = null;
+        let queue = [];
+        function connect() {
+            ws = new WebSocket('${WS_URL}');
+            ws.onopen = () => {
+                queue.forEach(msg => ws.send(msg));
+                queue = [];
+            };
+            ws.onclose = () => setTimeout(connect, 500);
+            ws.onerror = () => {};
+        }
+        connect();
+        onmessage = (e) => {
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(e.data.payload);
+            } else {
+                queue.push(e.data.payload);
+            }
+        };
+    `;
+    const wsWorker = new Worker(URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' })));
+
+    // ---------- State ----------
+    let lastState = null;
+    let pollingActive = false;
+
+    function statesEqual(s1, s2) {
+        if (!s1 || !s2) return false;
+        if (s1.axes.length !== s2.axes.length || s1.buttons.length !== s2.buttons.length) return false;
+        for (let i = 0; i < s1.axes.length; i++) if (s1.axes[i] !== s2.axes[i]) return false;
+        for (let i = 0; i < s1.buttons.length; i++) if (s1.buttons[i] !== s2.buttons[i]) return false;
+        return true;
+    }
+
+    function sendState(state) {
+        try {
+            wsWorker.postMessage({ type: 'state', payload: JSON.stringify(state) });
+        } catch (e) { console.error('[RAW11] sendState error:', e); }
+    }
+
+    // ---------- Poll ----------
+    function pollGamepad() {
+        const gp = navigator.getGamepads?.()[0];
+        if (!gp) {
+            pollingActive = false;
+            lastState = null;
+            return;
+        }
+
+        const state = {
+            ts: performance.now(),
+            axes: gp.axes.map(v => Math.abs(v) <= AXIS_EPSILON ? 0 : Math.round(v * AXIS_SCALE)/AXIS_SCALE),
+            buttons: gp.buttons.map(b => b.pressed ? 1 : 0)
+        };
+
+        if (!statesEqual(state, lastState)) {
+            sendState(state);
+            lastState = state;
+        }
+    }
+
+    function startPolling() {
+        if (pollingActive) return;
+        pollingActive = true;
+
+        const tick = () => {
+            if (!pollingActive) return;
+            pollGamepad();
+            requestAnimationFrame(() => queueMicrotask(tick));
+        };
+        tick();
+        console.log('[RAW11] Console polling started ~1ms, 0 deadzone');
+    }
+
+    // ---------- Gamepad Events ----------
+    window.addEventListener('gamepadconnected', e => { console.log('[RAW11] Gamepad connected:', e.gamepad); startPolling(); });
+    window.addEventListener('gamepaddisconnected', e => { console.log('[RAW11] Gamepad disconnected:', e.gamepad); pollingActive=false; lastState=null; });
+
+    if (navigator.getGamepads?.()[0]) startPolling();
+
+    // ---------- Keepalive ----------
+    setInterval(() => {
+        try {
+            navigator.sendBeacon ? navigator.sendBeacon('/keepalive') : fetch('/keepalive', { method:'POST', keepalive:true });
+        } catch {}
+    }, KEEPALIVE_MS);
+
+})();
+</script>
+
+</body>
+</html>
